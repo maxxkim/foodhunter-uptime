@@ -1,0 +1,118 @@
+# External uptime ping: GitHub's runners check the API and the site from outside the server, so a
+# server that is down as a whole (which its own watchdog cannot report) still gets noticed.
+# A target is down after two failed checks a minute apart; the Telegram chat of the alerts hears
+# once when it goes down and once when it is back. Nothing here deploys.
+# Server side and the other alerts: docs/DEPLOY.md («Мониторинг и алерты») in foodhunter-backend.
+name: Uptime
+
+on:
+  schedule:
+    # Every 5 minutes: free because the repository is public. GitHub may start a scheduled run late
+    # under load, and turns the schedule off after 60 days without commits (README).
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One check at a time: a late run waits instead of reporting the same outage twice.
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: ping
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      # The previous result ("api=up", "site=down 1761550000"), newest first. The key of this run
+      # never exists, so restore-keys always brings the latest state saved by an earlier run.
+      - name: Restore the previous state
+        uses: actions/cache/restore@v6
+        with:
+          path: .uptime
+          key: uptime-state-${{ github.run_id }}
+          restore-keys: uptime-state-
+
+      - name: Check the API and the site
+        id: check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p .uptime
+          touch .uptime/state
+          cp .uptime/state .uptime/previous
+
+          targets=(
+            "api|API|https://api.foodhunter.moscow/api/v1/health"
+            "site|Сайт|https://foodhunter.moscow/"
+          )
+
+          # Up if one of two tries a minute apart answers 2xx: one lost request is not an outage.
+          probe() {
+            for attempt in 1 2; do
+              if curl --fail --silent --show-error --output /dev/null --max-time 20 \
+                  --user-agent "foodhunter-uptime (GitHub Actions)" "$1"; then
+                return 0
+              fi
+              [ "$attempt" = 1 ] && sleep 60
+            done
+            return 1
+          }
+
+          notify() {
+            if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+              echo "::error::TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret is missing: $1"
+              return 1
+            fi
+            curl --fail --silent --show-error --output /dev/null --max-time 20 \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=$1"
+          }
+
+          now=$(date +%s)
+          moment=$(TZ=Europe/Moscow date '+%d.%m %H:%M МСК')
+          failed=0
+          : > .uptime/state
+          for target in "${targets[@]}"; do
+            IFS='|' read -r name label url <<< "$target"
+            previous=$(sed -n "s/^$name=//p" .uptime/previous)
+            if probe "$url"; then
+              echo "$name=up" >> .uptime/state
+              echo "$label: up"
+              if [[ "$previous" == down* ]]; then
+                since=${previous#down }
+                minutes=$(( (now - ${since:-$now}) / 60 ))
+                notify "Фудхантер: $label снова отвечает ($url), $moment. Не отвечал около $minutes мин." \
+                  || failed=1
+              fi
+            else
+              echo "$label: DOWN"
+              if [[ "$previous" == down* ]]; then
+                echo "$name=$previous" >> .uptime/state
+              else
+                echo "$name=down $now" >> .uptime/state
+                notify "Фудхантер: $label не отвечает ($url) — две проверки подряд с GitHub Actions, $moment." \
+                  || failed=1
+              fi
+            fi
+          done
+
+          # A state that changed is saved for the next run, but only once the chat heard of it:
+          # an unsent alert is tried again on the next run.
+          if [ "$failed" = 1 ]; then
+            exit 1
+          fi
+          if ! cmp -s .uptime/state .uptime/previous; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the new state
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .uptime
+          key: uptime-state-${{ github.run_id }}
